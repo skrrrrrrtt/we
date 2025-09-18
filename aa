@@ -1,0 +1,175 @@
+--[[ 
+    CooperHub | Auto Fishing + Misc System
+    AFK Fishing with Rayfield UI
+    Features:
+    - Auto Fishing
+    - Auto Potion
+    - Auto Lottery
+    - Auto Like
+]]
+
+-- Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local Player = Players.LocalPlayer
+
+-- Character refs
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local HRP = Character:WaitForChild("HumanoidRootPart")
+
+-- UI
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+----------------------------------------------------------------------
+-- AUTO FISHING
+----------------------------------------------------------------------
+
+local active = false
+local selectedBait = "FishingBait1"
+local castThread
+local lastCastPos, lastCastPosAt = nil, 0
+local teleportDelay = 100 -- ms between casts
+
+local function ensureFishRobFocus()
+    local ok = pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("CharacterRE"):FireServer("Focus", "FishRob")
+    end)
+    return ok == true
+end
+
+local function getCachedCastPos()
+    local now = tick()
+    if (not lastCastPos) or (now - lastCastPosAt >= 5) then
+        lastCastPos = HRP.Position + Vector3.new(0, 10, 0)
+        lastCastPosAt = now
+    end
+    return lastCastPos
+end
+
+local function castOnce()
+    if not ensureFishRobFocus() then return end
+
+    pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("FishingRE"):FireServer("Start")
+    end)
+
+    local pos = getCachedCastPos()
+
+    pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("FishingRE"):FireServer("Throw", {
+            Bait = selectedBait,
+            Pos = pos,
+            NoMove = true
+        })
+    end)
+
+    pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("FishingRE"):FireServer("POUT", {
+            SUC = 1,
+            NoMove = true
+        })
+    end)
+end
+
+local function loopCast()
+    while active do
+        castOnce()
+        task.wait(teleportDelay / 1000) -- ms -> seconds
+    end
+end
+
+local function setEnabled(state)
+    if state then
+        if active then return end
+        active = true
+        castThread = task.spawn(loopCast)
+    else
+        active = false
+        if castThread then task.cancel(castThread) castThread = nil end
+    end
+end
+
+local function setBait(baitId)
+    if baitId then
+        selectedBait = baitId
+    end
+end
+
+----------------------------------------------------------------------
+-- RAYFIELD UI: MAIN WINDOW
+----------------------------------------------------------------------
+
+local Window = Rayfield:CreateWindow({
+    Name = "CooperHub | AFK Fishing",
+    LoadingTitle = "AutoFish + Misc",
+    LoadingSubtitle = "by CooperHub",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "CooperHubFishing",
+        FileName = "FishConfig"
+    },
+    KeySystem = false
+})
+
+----------------------------------------------------------------------
+-- Fishing Tab
+----------------------------------------------------------------------
+
+local FishTab = Window:CreateTab("Fishing")
+
+FishTab:CreateToggle({
+    Name = "Auto Fish",
+    CurrentValue = false,
+    Callback = function(val)
+        setEnabled(val)
+    end
+})
+
+FishTab:CreateDropdown({
+    Name = "Select Bait",
+    Options = {"Bait 1","Bait 2","Bait 3"},
+    CurrentOption = "Bait 1",
+    MultipleOptions = false,
+    Callback = function(val)
+        if val == "Bait 1" then setBait("FishingBait1") end
+        if val == "Bait 2" then setBait("FishingBait2") end
+        if val == "Bait 3" then setBait("FishingBait3") end
+    end
+})
+
+FishTab:CreateSlider({
+    Name = "Cast Delay (ms)",
+    Range = {0, 1000},
+    Increment = 50,
+    CurrentValue = 100,
+    Callback = function(val)
+        teleportDelay = val
+    end
+})
+
+----------------------------------------------------------------------
+-- Misc Tab (Auto Potion, Auto Lottery, Auto Like)
+----------------------------------------------------------------------
+
+local MiscTab = Window:CreateTab("Misc")
+
+-- Drop your MiscSystem here
+local MiscSystem = loadstring(game:HttpGet("https://pastebin.com/raw/YOUR_MISC_CODE"))()
+MiscSystem.Init({
+    WindUI = Rayfield,
+    Tabs = { MiscTab = MiscTab },
+    Tab = MiscTab
+})
+
+----------------------------------------------------------------------
+-- Kill Switch
+----------------------------------------------------------------------
+
+MiscTab:CreateButton({
+    Name = "Terminate Script",
+    Callback = function()
+        Rayfield:Destroy()
+        script:Destroy()
+    end
+})
