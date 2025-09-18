@@ -1,0 +1,311 @@
+--[[ 
+    CooperHub | Auto Fishing + Egg Tracker
+    AFK Fishing with live Discord webhook updates
+    Webhook Config added to Rayfield UI
+]]
+
+-- Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local Player = Players.LocalPlayer
+
+-- Character refs
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local HRP = Character:WaitForChild("HumanoidRootPart")
+
+-- UI
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+----------------------------------------------------------------------
+-- STATE
+----------------------------------------------------------------------
+
+local active = false
+local selectedBait = "FishingBait1"
+local castThread
+local lastCastPos, lastCastPosAt = nil, 0
+local teleportDelay = 100
+
+-- Webhook state
+local webhookUrl = ""
+local webhookMessageId = nil
+
+----------------------------------------------------------------------
+-- EGG INVENTORY
+----------------------------------------------------------------------
+
+local function getEggInventory()
+    local eggs = {}
+
+    local playerGui = Player:FindFirstChild("PlayerGui")
+    if not playerGui then return eggs end
+
+    local data = playerGui:FindFirstChild("Data")
+    if not data then return eggs end
+
+    local eggContainer = data:FindFirstChild("Egg")
+    if not eggContainer then return eggs end
+
+    for _, child in ipairs(eggContainer:GetChildren()) do
+        if child:IsA("Configuration") then
+            local dAttr = child:GetAttribute("D")
+            local eggType = child:GetAttribute("T")
+            local mutation = child:GetAttribute("M")
+
+            -- Only count eggs WITHOUT "D" (unhatched)
+            if not dAttr and eggType then
+                if mutation == "Dino" then
+                    mutation = "Jurassic"
+                end
+
+                if not eggs[eggType] then
+                    eggs[eggType] = {
+                        total = 0,
+                        mutations = {}
+                    }
+                end
+
+                eggs[eggType].total += 1
+
+                if mutation then
+                    eggs[eggType].mutations[mutation] = (eggs[eggType].mutations[mutation] or 0) + 1
+                end
+            end
+        end
+    end
+
+    return eggs
+end
+
+----------------------------------------------------------------------
+-- WEBHOOK HELPERS
+----------------------------------------------------------------------
+
+local function buildEggEmbed()
+    local eggInventory = getEggInventory()
+    local fields = {}
+
+    for eggType, info in pairs(eggInventory) do
+        local value = "Total: **" .. tostring(info.total) .. "**"
+        
+        local muts = {}
+        for mut, count in pairs(info.mutations) do
+            table.insert(muts, mut .. " × " .. count)
+        end
+        if #muts > 0 then
+            value = value .. "\n" .. table.concat(muts, " • ")
+        end
+
+        table.insert(fields, {
+            name = "🥚 " .. eggType,
+            value = value,
+            inline = false
+        })
+    end
+
+    if #fields == 0 then
+        table.insert(fields, {
+            name = "No Eggs Yet",
+            value = "Go fish some 🐟",
+            inline = false
+        })
+    end
+
+    return {
+        content = nil,
+        embeds = {{
+            title = "🎣 Live Egg Tracker",
+            description = "Updated every 10s • AFK Mode",
+            color = 3447003,
+            fields = fields,
+            footer = { text = "AFK Fishing • CooperHub" },
+            timestamp = DateTime.now():ToIsoDate()
+        }}
+    }
+end
+
+local function sendOrUpdateEggs()
+    if webhookUrl == "" then return end
+    local payload = HttpService:JSONEncode(buildEggEmbed())
+
+    if not webhookMessageId or webhookMessageId == "" then
+        local success, res = pcall(function()
+            return http_request({
+                Url = webhookUrl,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = payload
+            })
+        end)
+        if success and res and res.Body then
+            local ok, data = pcall(function()
+                return HttpService:JSONDecode(res.Body)
+            end)
+            if ok and data and data.id then
+                webhookMessageId = data.id
+            end
+        end
+    else
+        local success, res = pcall(function()
+            return http_request({
+                Url = webhookUrl .. "/messages/" .. webhookMessageId,
+                Method = "PATCH",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = payload
+            })
+        end)
+
+        if not success or (res and res.StatusCode ~= 200) then
+            warn("Webhook update failed, creating new...")
+            webhookMessageId = nil
+            sendOrUpdateEggs()
+        end
+    end
+end
+
+-- Background updater
+task.spawn(function()
+    while true do
+        sendOrUpdateEggs()
+        task.wait(10)
+    end
+end)
+
+----------------------------------------------------------------------
+-- AUTO FISHING CORE
+----------------------------------------------------------------------
+
+local function ensureFishRobFocus()
+    local ok = pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("CharacterRE"):FireServer("Focus", "FishRob")
+    end)
+    return ok == true
+end
+
+local function getCachedCastPos()
+    local now = tick()
+    if (not lastCastPos) or (now - lastCastPosAt >= 5) then
+        lastCastPos = HRP.Position + Vector3.new(0, 10, 0)
+        lastCastPosAt = now
+    end
+    return lastCastPos
+end
+
+local function castOnce()
+    if not ensureFishRobFocus() then return end
+    pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("FishingRE"):FireServer("Start")
+    end)
+    local pos = getCachedCastPos()
+    pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("FishingRE"):FireServer("Throw", {
+            Bait = selectedBait,
+            Pos = pos,
+            NoMove = true
+        })
+    end)
+    pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("FishingRE"):FireServer("POUT", {
+            SUC = 1,
+            NoMove = true
+        })
+    end)
+end
+
+local function loopCast()
+    while active do
+        castOnce()
+        task.wait(teleportDelay / 1000) -- ms -> seconds
+    end
+end
+
+local function setEnabled(state)
+    if state then
+        if active then return end
+        active = true
+        castThread = task.spawn(loopCast)
+    else
+        active = false
+        if castThread then task.cancel(castThread) castThread = nil end
+    end
+end
+
+local function setBait(baitId)
+    if baitId then
+        selectedBait = baitId
+    end
+end
+
+----------------------------------------------------------------------
+-- RAYFIELD UI
+----------------------------------------------------------------------
+
+local Window = Rayfield:CreateWindow({
+    Name = "CooperHub | AFK Fishing",
+    LoadingTitle = "AutoFish",
+    LoadingSubtitle = "by CooperHub",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "CooperHubFishing",
+        FileName = "FishConfig"
+    },
+    KeySystem = false
+})
+
+local FishTab = Window:CreateTab("Fishing")
+
+FishTab:CreateToggle({
+    Name = "Auto Fish",
+    CurrentValue = false,
+    Callback = function(val)
+        setEnabled(val)
+    end
+})
+
+FishTab:CreateDropdown({
+    Name = "Select Bait",
+    Options = {"Bait 1","Bait 2","Bait 3"},
+    CurrentOption = "Bait 1",
+    MultipleOptions = false,
+    Callback = function(val)
+        if val == "Bait 1" then setBait("FishingBait1") end
+        if val == "Bait 2" then setBait("FishingBait2") end
+        if val == "Bait 3" then setBait("FishingBait3") end
+    end
+})
+
+FishTab:CreateSlider({
+    Name = "Teleport Delay (ms)",
+    Range = {0, 1000},
+    Increment = 50,
+    CurrentValue = 100,
+    Callback = function(val)
+        teleportDelay = val
+    end
+})
+
+-- Webhook tab
+local WebhookTab = Window:CreateTab("Webhook")
+
+WebhookTab:CreateInput({
+    Name = "Webhook URL",
+    PlaceholderText = "Paste Discord Webhook URL",
+    RemoveTextAfterFocus = false,
+    Callback = function(val)
+        webhookUrl = val
+        webhookMessageId = nil -- always reset on new URL
+        print("Webhook URL set:", webhookUrl)
+    end
+})
+
+local MiscTab = Window:CreateTab("Misc")
+
+MiscTab:CreateButton({
+    Name = "Terminate Script",
+    Callback = function()
+        Rayfield:Destroy()
+        script:Destroy()
+    end
+})
