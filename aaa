@@ -1,0 +1,246 @@
+--[[ 
+    CooperHub | Auto Fishing Only
+    Cleaned up to focus purely on AFK Fishing
+    Inspired by Zebux's AutoFishSystem v3
+]]
+
+-- Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ContextActionService = game:GetService("ContextActionService")
+local Player = Players.LocalPlayer
+
+-- Character refs
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local HRP = Character:WaitForChild("HumanoidRootPart")
+local Humanoid = Character:WaitForChild("Humanoid")
+
+-- Rayfield Loader
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+-- State
+local active = false
+local selectedBait = "FishingBait1"
+local safeCF = nil
+local freezeConn = nil
+local castThread = nil
+local holdConn = nil
+local teleportDelay = 100 -- ms, optional if you still want tp delay
+local lastCastPos = nil
+local lastCastPosAt = 0
+
+-- Config
+local FishingConfig = {
+    SelectedBait = "FishingBait1",
+    AutoFishEnabled = false,
+    VerticalOffset = 10,
+}
+
+----------------------------------------------------------------------
+-- HELPERS
+----------------------------------------------------------------------
+
+-- Read Focus
+local function readHoldUID()
+    local attrVal = nil
+    pcall(function()
+        attrVal = Player:GetAttribute("HoldUID")
+    end)
+    if attrVal and tostring(attrVal) ~= "" then return tostring(attrVal) end
+    local vobj = Player:FindFirstChild("HoldUID")
+    if vobj and vobj:IsA("ValueBase") and vobj.Value and tostring(vobj.Value) ~= "" then
+        return tostring(vobj.Value)
+    end
+    return nil
+end
+
+local function ensureFishRobFocus()
+    if readHoldUID() == "FishRob" then return true end
+    local ok = pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("CharacterRE"):FireServer("Focus", "FishRob")
+    end)
+    return ok == true
+end
+
+-- Anchor helpers
+local controlsRef = nil
+local function anchorPlayer()
+    safeCF = HRP.CFrame
+    Humanoid.AutoRotate = false
+    Humanoid.WalkSpeed = 0
+    Humanoid.JumpPower = 0
+    HRP.Anchored = true
+
+    if freezeConn then freezeConn:Disconnect() freezeConn = nil end
+    freezeConn = RunService.Heartbeat:Connect(function()
+        if not active then return end
+        pcall(function()
+            if HRP then
+                HRP.Anchored = true
+                if safeCF then HRP.CFrame = safeCF end
+                HRP.AssemblyLinearVelocity = Vector3.zero
+                HRP.AssemblyAngularVelocity = Vector3.zero
+            end
+        end)
+    end)
+
+    -- Sink WASD/Space
+    ContextActionService:BindAction("AFS_BlockMovement", function()
+        return Enum.ContextActionResult.Sink
+    end, false,
+        Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+        Enum.KeyCode.Space, Enum.KeyCode.LeftShift
+    )
+
+    -- Disable PlayerModule controls
+    pcall(function()
+        local ps = Player:FindFirstChild("PlayerScripts")
+        local pm = ps and ps:FindFirstChild("PlayerModule")
+        local cm = pm and pm:FindFirstChild("ControlModule")
+        if cm then
+            local controls = require(cm)
+            controlsRef = controls
+            if controls and controls.Disable then controls:Disable() end
+        end
+    end)
+end
+
+local function unanchorPlayer()
+    ContextActionService:UnbindAction("AFS_BlockMovement")
+    if freezeConn then freezeConn:Disconnect() freezeConn = nil end
+    Humanoid.AutoRotate = true
+    Humanoid.WalkSpeed = 16
+    Humanoid.JumpPower = 50
+    HRP.Anchored = false
+    pcall(function()
+        if controlsRef and controlsRef.Enable then controlsRef:Enable() end
+        controlsRef = nil
+    end)
+    safeCF = nil
+end
+
+-- Cast helpers
+local function getCachedCastPos()
+    local now = tick()
+    if (not lastCastPos) or (now - lastCastPosAt >= 5) then
+        lastCastPos = HRP.Position + Vector3.new(0, FishingConfig.VerticalOffset, 0)
+        lastCastPosAt = now
+    end
+    return lastCastPos
+end
+
+local function castOnce()
+    if not ensureFishRobFocus() then return end
+    pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("FishingRE"):FireServer("Start")
+    end)
+    local pos = getCachedCastPos()
+    pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("FishingRE"):FireServer("Throw", {
+            Bait = selectedBait,
+            Pos = pos,
+            NoMove = true
+        })
+    end)
+    pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("FishingRE"):FireServer("POUT", {
+            SUC = 1,
+            NoMove = true
+        })
+    end)
+end
+
+local function loopCast()
+    while active do
+        castOnce()
+        RunService.Heartbeat:Wait()
+    end
+end
+
+-- API
+local function setEnabled(state)
+    if state then
+        if active then return end
+        active = true
+        anchorPlayer()
+        lastCastPos = nil
+        lastCastPosAt = 0
+
+        holdConn = Player:GetAttributeChangedSignal("HoldUID"):Connect(function()
+            if active and readHoldUID() == "FishRob" then castOnce() end
+        end)
+        castThread = task.spawn(loopCast)
+    else
+        active = false
+        if castThread then task.cancel(castThread) castThread = nil end
+        if holdConn then holdConn:Disconnect() holdConn = nil end
+        unanchorPlayer()
+        lastCastPos = nil
+        lastCastPosAt = 0
+    end
+end
+
+local function setBait(baitId)
+    if baitId then
+        selectedBait = baitId
+    end
+end
+
+----------------------------------------------------------------------
+-- RAYFIELD UI
+----------------------------------------------------------------------
+
+local Window = Rayfield:CreateWindow({
+    Name = "CooperHub | AFK Fishing",
+    LoadingTitle = "AutoFish",
+    LoadingSubtitle = "by CooperHub",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "CooperHubFishing",
+        FileName = "FishConfig"
+    },
+    KeySystem = false
+})
+
+local FishTab = Window:CreateTab("Fishing")
+
+FishTab:CreateToggle({
+    Name = "Auto Fish",
+    CurrentValue = false,
+    Callback = function(val)
+        setEnabled(val)
+    end
+})
+
+FishTab:CreateDropdown({
+    Name = "Select Bait",
+    Options = {"Bait 1","Bait 2","Bait 3"},
+    CurrentOption = "Bait 1",
+    MultipleOptions = false,
+    Callback = function(val)
+        if val == "Bait 1" then setBait("FishingBait1") end
+        if val == "Bait 2" then setBait("FishingBait2") end
+        if val == "Bait 3" then setBait("FishingBait3") end
+    end
+})
+
+FishTab:CreateSlider({
+    Name = "Teleport Delay (ms)",
+    Range = {0, 1000},
+    Increment = 50,
+    CurrentValue = 100,
+    Callback = function(val)
+        teleportDelay = val
+    end
+})
+
+local MiscTab = Window:CreateTab("Misc")
+
+MiscTab:CreateButton({
+    Name = "Terminate Script",
+    Callback = function()
+        Rayfield:Destroy()
+        script:Destroy()
+    end
+})
