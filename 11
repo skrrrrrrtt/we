@@ -1,0 +1,318 @@
+--[[ 
+    CooperHub | AFK Fishing + Auto Like
+    AFK Fishing + Misc Auto Like system
+]]
+
+-- Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ContextActionService = game:GetService("ContextActionService")
+local TeleportService = game:GetService("TeleportService")
+local Player = Players.LocalPlayer
+
+-- Character refs
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local HRP = Character:WaitForChild("HumanoidRootPart")
+local Humanoid = Character:WaitForChild("Humanoid")
+
+-- Rayfield Loader
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+-- Config / State
+local FishingConfig = {
+    SelectedBait = "FishingBait1",
+    AutoFishEnabled = false,
+    VerticalOffset = 10,
+}
+local active = false
+local safeCF, freezeConn, castThread, holdConn = nil, nil, nil, nil
+local lastCastPos, lastCastPosAt = nil, 0
+local teleportDelay = 100
+
+----------------------------------------------------------------------
+-- FISHING HELPERS
+----------------------------------------------------------------------
+
+local function readHoldUID()
+    local attrVal = nil
+    pcall(function() attrVal = Player:GetAttribute("HoldUID") end)
+    if attrVal and tostring(attrVal) ~= "" then return tostring(attrVal) end
+    local vobj = Player:FindFirstChild("HoldUID")
+    if vobj and vobj:IsA("ValueBase") and tostring(vobj.Value) ~= "" then
+        return tostring(vobj.Value)
+    end
+    return nil
+end
+
+local function ensureFishRobFocus()
+    if readHoldUID() == "FishRob" then return true end
+    local ok = pcall(function()
+        ReplicatedStorage:WaitForChild("Remote"):WaitForChild("CharacterRE"):FireServer("Focus", "FishRob")
+    end)
+    return ok == true
+end
+
+local controlsRef = nil
+local function anchorPlayer()
+    safeCF = HRP.CFrame
+    Humanoid.AutoRotate = false
+    Humanoid.WalkSpeed = 0
+    Humanoid.JumpPower = 0
+    HRP.Anchored = true
+
+    if freezeConn then freezeConn:Disconnect() freezeConn = nil end
+    freezeConn = RunService.Heartbeat:Connect(function()
+        if not active then return end
+        pcall(function()
+            if HRP then
+                HRP.Anchored = true
+                if safeCF then HRP.CFrame = safeCF end
+                HRP.AssemblyLinearVelocity = Vector3.zero
+                HRP.AssemblyAngularVelocity = Vector3.zero
+            end
+        end)
+    end)
+
+    ContextActionService:BindAction("AFS_BlockMovement", function()
+        return Enum.ContextActionResult.Sink
+    end, false, Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D, Enum.KeyCode.Space, Enum.KeyCode.LeftShift)
+
+    pcall(function()
+        local ps = Player:FindFirstChild("PlayerScripts")
+        local pm = ps and ps:FindFirstChild("PlayerModule")
+        local cm = pm and pm:FindFirstChild("ControlModule")
+        if cm then
+            local controls = require(cm)
+            controlsRef = controls
+            if controls and controls.Disable then controls:Disable() end
+        end
+    end)
+end
+
+local function unanchorPlayer()
+    ContextActionService:UnbindAction("AFS_BlockMovement")
+    if freezeConn then freezeConn:Disconnect() freezeConn = nil end
+    Humanoid.AutoRotate = true
+    Humanoid.WalkSpeed = 16
+    Humanoid.JumpPower = 50
+    HRP.Anchored = false
+    pcall(function()
+        if controlsRef and controlsRef.Enable then controlsRef:Enable() end
+        controlsRef = nil
+    end)
+    safeCF = nil
+end
+
+local function getCachedCastPos()
+    local now = tick()
+    if (not lastCastPos) or (now - lastCastPosAt >= 5) then
+        lastCastPos = HRP.Position + Vector3.new(0, FishingConfig.VerticalOffset, 0)
+        lastCastPosAt = now
+    end
+    return lastCastPos
+end
+
+local function castOnce()
+    if not ensureFishRobFocus() then return end
+    pcall(function()
+        ReplicatedStorage.Remote.FishingRE:FireServer("Start")
+    end)
+    local pos = getCachedCastPos()
+    pcall(function()
+        ReplicatedStorage.Remote.FishingRE:FireServer("Throw", {
+            Bait = FishingConfig.SelectedBait,
+            Pos = pos,
+            NoMove = true
+        })
+    end)
+    pcall(function()
+        ReplicatedStorage.Remote.FishingRE:FireServer("POUT", {
+            SUC = 1,
+            NoMove = true
+        })
+    end)
+end
+
+local function loopCast()
+    while active do
+        castOnce()
+        task.wait(teleportDelay / 1000)
+    end
+end
+
+local function setEnabled(state)
+    if state then
+        if active then return end
+        active = true
+        anchorPlayer()
+        lastCastPos, lastCastPosAt = nil, 0
+        holdConn = Player:GetAttributeChangedSignal("HoldUID"):Connect(function()
+            if active and readHoldUID() == "FishRob" then castOnce() end
+        end)
+        castThread = task.spawn(loopCast)
+    else
+        active = false
+        if castThread then task.cancel(castThread) castThread = nil end
+        if holdConn then holdConn:Disconnect() holdConn = nil end
+        unanchorPlayer()
+        lastCastPos, lastCastPosAt = nil, 0
+    end
+end
+
+local function setBait(baitId)
+    if baitId then
+        FishingConfig.SelectedBait = baitId
+    end
+end
+
+----------------------------------------------------------------------
+-- AUTO LIKE (MISC FEATURE)
+----------------------------------------------------------------------
+
+local autoLikeEnabled = false
+local autoLikeThread = nil
+local likedUserIds = {}
+
+local function getLikeProgress()
+    local pg = Player:FindFirstChild("PlayerGui")
+    local data = pg and pg:FindFirstChild("Data")
+    local seasonPass = data and data:FindFirstChild("SeasonPass")
+    local season1 = seasonPass and seasonPass:FindFirstChild("Season1")
+    if not season1 then return 0, false, 0, false end
+    local likes = tonumber(season1:GetAttribute("D_LikeZoo")) or 0
+    local weeklyLikes = tonumber(season1:GetAttribute("W_LikeZoo")) or 0
+    local dailyComplete = likes >= 3
+    local weeklyComplete = weeklyLikes >= 20
+    return likes, dailyComplete, weeklyLikes, weeklyComplete
+end
+
+local function getRandomOtherUserId()
+    local me = Player
+    local candidates = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= me and not likedUserIds[plr.UserId] then
+            table.insert(candidates, plr.UserId)
+        end
+    end
+    if #candidates == 0 then return nil end
+    return candidates[math.random(1, #candidates)]
+end
+
+local function sendLikeTo(userId)
+    if not userId then return false end
+    local args = {"GiveLike", userId}
+    local ok = pcall(function()
+        ReplicatedStorage.Remote.CharacterRE:FireServer(unpack(args))
+    end)
+    return ok
+end
+
+local function hopServer()
+    pcall(function()
+        TeleportService:Teleport(game.PlaceId, Player)
+    end)
+end
+
+local function runAutoLike(statusParagraph)
+    local noTargetStreak = 0
+    while autoLikeEnabled do
+        local likes, dailyComplete, weeklyLikes, weeklyComplete = getLikeProgress()
+        if statusParagraph and statusParagraph.SetDesc then
+            local msg = string.format("Daily Like: %d/3 | Weekly Like: %d/20", likes, weeklyLikes)
+            statusParagraph:SetDesc(msg)
+        end
+        if dailyComplete and weeklyComplete then break end
+        local targetId = getRandomOtherUserId()
+        if not targetId then
+            noTargetStreak += 1
+            if not weeklyComplete and noTargetStreak >= 3 then
+                hopServer()
+                task.wait(3)
+            else
+                task.wait(2)
+            end
+        else
+            noTargetStreak = 0
+            sendLikeTo(targetId)
+            likedUserIds[targetId] = true
+            task.wait(1)
+        end
+    end
+end
+
+----------------------------------------------------------------------
+-- RAYFIELD UI
+----------------------------------------------------------------------
+
+local Window = Rayfield:CreateWindow({
+    Name = "CooperHub | AFK Fishing",
+    LoadingTitle = "AutoFish",
+    LoadingSubtitle = "by CooperHub",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "CooperHubFishing",
+        FileName = "FishConfig"
+    },
+    KeySystem = false
+})
+
+-- Fishing Tab
+local FishTab = Window:CreateTab("Fishing")
+
+FishTab:CreateToggle({
+    Name = "Auto Fish",
+    CurrentValue = false,
+    Callback = function(val) setEnabled(val) end
+})
+
+FishTab:CreateDropdown({
+    Name = "Select Bait",
+    Options = {"Bait 1","Bait 2","Bait 3"},
+    CurrentOption = {"Bait 1"},
+    MultipleOptions = false,
+    Callback = function(val)
+        local selected = val[1] -- fix: Rayfield returns table
+        local baitMap = {
+            ["Bait 1"] = "FishingBait1",
+            ["Bait 2"] = "FishingBait2",
+            ["Bait 3"] = "FishingBait3"
+        }
+        setBait(baitMap[selected])
+    end
+})
+
+FishTab:CreateSlider({
+    Name = "Teleport Delay (ms)",
+    Range = {0, 1000},
+    Increment = 50,
+    CurrentValue = 100,
+    Callback = function(val) teleportDelay = val end
+})
+
+-- Misc Tab
+local MiscTab = Window:CreateTab("Misc")
+
+local likeStatus = MiscTab:CreateParagraph({Title = "Like Progress", Content = "Daily Like: 0/3 | Weekly Like: 0/20"})
+MiscTab:CreateToggle({
+    Name = "Auto Like Other Zoos",
+    CurrentValue = false,
+    Callback = function(state)
+        autoLikeEnabled = state
+        if state and not autoLikeThread then
+            likedUserIds = {}
+            autoLikeThread = task.spawn(function()
+                runAutoLike(likeStatus)
+                autoLikeThread = nil
+            end)
+        end
+    end
+})
+
+MiscTab:CreateButton({
+    Name = "Terminate Script",
+    Callback = function()
+        Rayfield:Destroy()
+        script:Destroy()
+    end
+})
